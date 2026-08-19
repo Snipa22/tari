@@ -445,4 +445,134 @@ mod test {
         assert_eq!(json["public_key"], expected_pk_hex);
         assert_eq!(json["node_id"], expected_nodeid_hex);
     }
+
+    // --- Design gap: a gossiped, never-dialed address masks `Peer::is_offline()` -----------------------------------
+    //
+    // `Peer::is_offline()` delegates to `MultiaddressesWithStats::offline_at()`, which in turn picks the
+    // *minimum* `offline_at()` across all of a peer's addresses. Because an address that has never been dialed
+    // (which is exactly what an address learned purely from another peer's gossip looks like before we ever attempt
+    // to connect to it ourselves) reports `offline_at() == None`, and `None` sorts below every `Some(_)` timestamp,
+    // a single never-dialed address is enough to make the whole peer permanently report as "not offline" - no
+    // matter how many times its other, directly-dialed addresses have failed. There is no TTL that ages the
+    // gossiped address out, so nothing ever un-masks the real status.
+    #[test]
+    fn peer_with_only_a_failing_dialed_address_is_reported_offline() {
+        let mut rng = rand::rng();
+        let (_sk, pk) = CommsPublicKey::random_keypair(&mut rng);
+        let node_id = NodeId::from_key(&pk);
+        let dialed_addr = "/ip4/10.0.0.1/tcp/18189".parse::<Multiaddr>().unwrap();
+        let addresses =
+            MultiaddressesWithStats::from_addresses_with_source(vec![dialed_addr.clone()], &PeerAddressSource::Config);
+        let mut peer = Peer::new(
+            pk,
+            node_id,
+            addresses,
+            PeerFlags::default(),
+            PeerFeatures::COMMUNICATION_NODE,
+            Default::default(),
+            Default::default(),
+        );
+
+        for _ in 0..5 {
+            assert!(
+                peer.addresses
+                    .mark_failed_connection_attempt(&dialed_addr, "connection refused".to_string())
+            );
+        }
+
+        assert!(
+            peer.is_offline(),
+            "a peer whose only address has repeatedly failed to connect must be reported offline"
+        );
+        assert!(peer.all_addresses_failed());
+    }
+
+    /// The design gap: learning about (but never dialing) a second, gossiped address for the same peer flips
+    /// `is_offline()` back to `false`, even though the directly-dialed address is still failing every attempt.
+    #[test]
+    fn gossiped_never_dialed_address_masks_peer_is_offline() {
+        use tari_crypto::keys::SecretKey;
+
+        use crate::{
+            peer_manager::{IdentitySignature, PeerIdentityClaim},
+            types::CommsSecretKey,
+        };
+
+        let mut rng = rand::rng();
+        let (_sk, pk) = CommsPublicKey::random_keypair(&mut rng);
+        let node_id = NodeId::from_key(&pk);
+        let dialed_addr = "/ip4/10.0.0.1/tcp/18189".parse::<Multiaddr>().unwrap();
+        let gossiped_addr = "/ip4/203.0.113.77/tcp/18189".parse::<Multiaddr>().unwrap();
+
+        let addresses =
+            MultiaddressesWithStats::from_addresses_with_source(vec![dialed_addr.clone()], &PeerAddressSource::Config);
+        let mut peer = Peer::new(
+            pk,
+            node_id,
+            addresses,
+            PeerFlags::default(),
+            PeerFeatures::COMMUNICATION_NODE,
+            Default::default(),
+            Default::default(),
+        );
+
+        for _ in 0..5 {
+            assert!(
+                peer.addresses
+                    .mark_failed_connection_attempt(&dialed_addr, "connection refused".to_string())
+            );
+        }
+        assert!(peer.is_offline(), "sanity check: peer must be offline before gossip arrives");
+
+        // Another peer gossips this peer's presence to us with an address we never dial ourselves.
+        let source_peer = CommsPublicKey::from_secret_key(&CommsSecretKey::random(&mut rand::rng()));
+        let signature = {
+            let secret = CommsSecretKey::random(&mut rand::rng());
+            IdentitySignature::sign_new(
+                &secret,
+                PeerFeatures::COMMUNICATION_NODE,
+                std::slice::from_ref(&gossiped_addr),
+                Utc::now(),
+            )
+        };
+        peer.update_addresses(
+            std::slice::from_ref(&gossiped_addr),
+            &PeerAddressSource::FromAnotherPeer {
+                peer_identity_claim: PeerIdentityClaim {
+                    addresses: vec![gossiped_addr.clone()],
+                    features: PeerFeatures::COMMUNICATION_NODE,
+                    signature,
+                },
+                source_peer,
+            },
+        );
+
+        // The gossiped address was genuinely never dialed by this node.
+        assert!(
+            peer.addresses
+                .addresses()
+                .iter()
+                .find(|a| a.address() == &gossiped_addr)
+                .unwrap()
+                .last_attempted()
+                .is_none()
+        );
+
+        // BUG: the peer now reports as online even though the only address we have ever actually dialed is still
+        // failing every attempt.
+        assert!(
+            !peer.is_offline(),
+            "design gap: an unverified gossiped address masks the peer's real, dialed-and-failing offline status"
+        );
+
+        // The directly-dialed address is, of course, still failing - nothing about it changed.
+        let dialed = peer
+            .addresses
+            .addresses()
+            .iter()
+            .find(|a| a.address() == &dialed_addr)
+            .unwrap();
+        assert!(dialed.offline_at().is_some());
+        assert!(dialed.last_failed_reason().is_some());
+    }
 }
