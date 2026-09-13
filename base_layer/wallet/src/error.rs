@@ -24,7 +24,7 @@ use diesel::result::Error as DieselError;
 use log::SetLoggerError;
 use serde_json::Error as SerdeJsonError;
 use tari_common::exit_codes::{ExitCode, ExitError};
-use tari_common_sqlite::error::SqliteStorageError;
+use tari_common_sqlite::error::{SqliteStorageError, StorageError};
 use tari_comms::{
     connectivity::ConnectivityError,
     multiaddr,
@@ -180,6 +180,12 @@ pub enum WalletStorageError {
     RecoverySeedError(String),
     #[error("Bad encryption version: `{0}`")]
     BadEncryptionVersion(String),
+}
+
+impl From<StorageError> for WalletStorageError {
+    fn from(err: StorageError) -> Self {
+        WalletStorageError::DatabaseMigrationError(err.to_string())
+    }
 }
 
 impl From<HexError> for WalletStorageError {

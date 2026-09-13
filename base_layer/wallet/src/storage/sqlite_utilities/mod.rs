@@ -25,7 +25,7 @@ use std::{fs::File, ops::DerefMut, path::Path};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
 use fs2::FileExt;
 use log::*;
-use tari_common_sqlite::{PRAGMA_BUSY_TIMEOUT, sqlite_connection_pool::SqliteConnectionPool};
+use tari_common_sqlite::{PRAGMA_BUSY_TIMEOUT, connection::DbConnection, sqlite_connection_pool::SqliteConnectionPool};
 use tari_transaction_key_manager::storage::sqlite_db::TransactionKeyManagerSqliteDatabase;
 use tari_utilities::SafePassword;
 pub use wallet_db_connection::WalletDbConnection;
@@ -55,20 +55,28 @@ pub fn run_migration_and_create_sqlite_connection<P: AsRef<Path>>(
         .to_str()
         .ok_or(WalletStorageError::InvalidUnicodePath)?;
 
-    let mut pool = SqliteConnectionPool::new(
-        String::from(path_str),
-        sqlite_pool_size,
-        true,
-        true,
-        PRAGMA_BUSY_TIMEOUT,
-    );
-    pool.create_pool()?;
-    let mut connection = pool.get_pooled_connection()?;
+    // Hold the process-wide migration write lock across pool creation, the first connection
+    // acquisition, and the migration run. This mirrors `DbConnection::connect_and_migrate*` so
+    // that `ConnectionOptions::on_acquire`'s `migration_lock_active()` check sees this as an
+    // active migration window and is permitted to flip the connection to WAL mode.
+    let pool = DbConnection::with_migration_write_lock(|| {
+        let mut pool = SqliteConnectionPool::new(
+            String::from(path_str),
+            sqlite_pool_size,
+            true,
+            true,
+            PRAGMA_BUSY_TIMEOUT,
+        );
+        pool.create_pool()?;
+        let mut connection = pool.get_pooled_connection()?;
 
-    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
-    connection
-        .run_pending_migrations(MIGRATIONS)
-        .map_err(|err| WalletStorageError::DatabaseMigrationError(format!("Database migration failed {err}")))?;
+        const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
+        connection
+            .run_pending_migrations(MIGRATIONS)
+            .map_err(|err| WalletStorageError::DatabaseMigrationError(format!("Database migration failed {err}")))?;
+
+        Ok::<_, WalletStorageError>(pool)
+    })?;
 
     Ok(WalletDbConnection::new(pool, Some(file_lock)))
 }

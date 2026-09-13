@@ -1419,4 +1419,67 @@ mod test {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0], block2);
     }
+
+    // Regression test: the wallet's SQLite bootstrap builds its own `SqliteConnectionPool`
+    // directly rather than going through `DbConnection::connect_and_migrate*`. Before this fix,
+    // that meant `ConnectionOptions::on_acquire`'s `migration_lock_active()` check never saw an
+    // active migration window for the wallet's primary database, so the WAL-flip branch never
+    // fired and the database silently stayed in the default rollback-journal (`DELETE`) mode.
+    #[test]
+    fn bootstrap_enables_wal_mode() {
+        use diesel::{dsl::sql, sql_types::Text};
+
+        let db_name = format!("{}.sqlite3", string(8).as_str());
+        let db_tempdir = tempdir().unwrap();
+        let db_folder = db_tempdir.path().to_str().unwrap().to_string();
+        let db_path = format!("{db_folder}/{db_name}");
+
+        let connection = run_migration_and_create_sqlite_connection(db_path, 16).unwrap();
+        let mut conn = connection.get_pooled_connection().unwrap();
+
+        let journal_mode: String = sql::<Text>("PRAGMA journal_mode;").get_result(&mut conn).unwrap();
+        println!("bootstrap_enables_wal_mode: journal_mode = '{journal_mode}'");
+        assert!(
+            journal_mode.eq_ignore_ascii_case("wal"),
+            "expected wallet bootstrap to enable WAL mode, got journal_mode = '{journal_mode}'"
+        );
+    }
+
+    // Confirms the fix does not reintroduce the `SQLITE_BUSY` race that PR #7492 fixed: spawn many
+    // threads, each independently bootstrapping (pool + first connection + migrations) against its
+    // *own* temp db file concurrently. `DbConnection::with_migration_write_lock` serializes every
+    // caller process-wide (by design - it's a single global lock), so none of these WAL-flip
+    // attempts can race each other even though the files are unrelated. Each must succeed and end
+    // up in WAL mode.
+    #[test]
+    fn concurrent_bootstrap_across_different_files_does_not_race_wal_flip() {
+        use diesel::{dsl::sql, sql_types::Text};
+
+        const THREADS: usize = 12;
+
+        let db_tempdir = tempdir().unwrap();
+        let db_folder = db_tempdir.path().to_str().unwrap().to_string();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let db_path = format!("{db_folder}/concurrent-{i}-{}.sqlite3", string(8).as_str());
+                std::thread::spawn(move || {
+                    let connection = run_migration_and_create_sqlite_connection(db_path, 4)
+                        .unwrap_or_else(|e| panic!("thread {i} failed to bootstrap: {e}"));
+                    let mut conn = connection.get_pooled_connection().unwrap();
+                    let journal_mode: String = sql::<Text>("PRAGMA journal_mode;")
+                        .get_result(&mut conn)
+                        .unwrap_or_else(|e| panic!("thread {i} failed to read journal_mode: {e}"));
+                    assert!(
+                        journal_mode.eq_ignore_ascii_case("wal"),
+                        "thread {i}: expected WAL mode, got '{journal_mode}'"
+                    );
+                })
+            })
+            .collect();
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle.join().unwrap_or_else(|_| panic!("thread {i} panicked"));
+        }
+    }
 }

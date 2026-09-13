@@ -226,6 +226,23 @@ impl DbConnection {
         }
     }
 
+    /// Runs `f` while holding the process-wide migration write lock, so that
+    /// `ConnectionOptions::on_acquire`'s `migration_lock_active()` check sees this as an active
+    /// migration/bootstrap window and is permitted to flip a connection to WAL mode.
+    ///
+    /// Any caller that creates its own `SqliteConnectionPool` directly (bypassing
+    /// `DbConnection::connect_and_migrate*`) MUST wrap its first-connection-acquisition +
+    /// migration sequence in this to get WAL enabled correctly and safely (no racing with any
+    /// other connection's WAL flip attempt in this process).
+    pub fn with_migration_write_lock<F, T, E>(f: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+        E: From<StorageError>,
+    {
+        let _lock = Self::acquire_migration_write_lock().map_err(E::from)?;
+        f()
+    }
+
     /// Returns true **if** the migration write lock is currently held by *some* writer in this
     /// process. We detect this by attempting a non-blocking read; it fails while a write lock is
     /// held.
@@ -251,11 +268,12 @@ impl DbConnection {
         sqlite_pool_size: Option<usize>,
         busy_timeout: Duration,
     ) -> Result<Self, StorageError> {
-        let _lock = Self::acquire_migration_write_lock()?;
-        let conn = Self::connect_url_with_busy_timeout(db_url, sqlite_pool_size, busy_timeout)?;
-        let output = conn.migrate(migrations)?;
-        debug!(target: LOG_TARGET, "Database migration: {}", output.trim());
-        Ok(conn)
+        Self::with_migration_write_lock(|| {
+            let conn = Self::connect_url_with_busy_timeout(db_url, sqlite_pool_size, busy_timeout)?;
+            let output = conn.migrate(migrations)?;
+            debug!(target: LOG_TARGET, "Database migration: {}", output.trim());
+            Ok(conn)
+        })
     }
 
     fn temp_db_dir() -> PathBuf {
